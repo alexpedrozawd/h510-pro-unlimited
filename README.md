@@ -21,12 +21,12 @@ A lightweight Python service runs in the background and:
 
 ## Requirements
 
-- Linux with **systemd** (Ubuntu, Fedora, Arch, openSUSE, and derivatives)
+- Linux (any distribution — see compatibility table below)
 - **Python 3.10+**
 - **PipeWire** or **PulseAudio** (most modern desktop distros include one of these)
-- `amixer` (`alsa-utils`) and `paplay` / `pactl` (`pulseaudio-utils`)
+- `amixer` (`alsa-utils`) and `paplay` / `pactl` (`pulseaudio-utils` or `pipewire-pulse`)
 
-> The installer detects and installs missing dependencies automatically.
+> The installer detects your package manager and installs missing dependencies automatically.
 
 ## Installation
 
@@ -38,21 +38,36 @@ bash install.sh
 
 The installer will:
 1. Verify Python 3.10+
-2. Detect your package manager (apt / dnf / pacman / zypper) and install missing system dependencies
+2. Detect your package manager and install missing system dependencies
 3. Create an isolated Python virtual environment
-4. Install Python dependencies
-5. Register, enable and start the systemd user service automatically
+4. Install Python dependencies (pinned versions)
+5. Register and start the service using the best available method for your system
+
+## Service Installation Strategy
+
+The installer automatically picks the right method:
+
+| System | Method |
+|---|---|
+| systemd (most distros) | `systemctl --user` service with auto-restart |
+| No systemd + desktop (GNOME/KDE/XFCE) | XDG autostart (`~/.config/autostart`) |
+| No systemd + headless | `@reboot` via crontab |
 
 ## Checking the Service
 
+**systemd distros:**
 ```bash
-# Service status
 systemctl --user status h510-pro-unlimited
-
-# Live logs
 journalctl --user -u h510-pro-unlimited -f
+```
 
-# API
+**Non-systemd distros:**
+```bash
+tail -f ~/.local/share/h510-pro-unlimited/h510-pro.log
+```
+
+**All distros:**
+```bash
 curl http://localhost:8000/status
 ```
 
@@ -65,16 +80,22 @@ curl http://localhost:8000/status
 
 ## Compatibility
 
-| Distribution | Status |
-|---|---|
-| Ubuntu 22.04+ | ✅ Tested |
-| Debian 12+ | ✅ |
-| Fedora 34+ | ✅ |
-| Arch / Manjaro | ✅ |
-| openSUSE Leap / Tumbleweed | ✅ |
-| Linux Mint / Pop!_OS / Zorin | ✅ (Ubuntu-based) |
-| Ubuntu 20.04 / Debian 11 | ⚠️ Requires Python 3.10+ installed manually |
-| Alpine / Void / Devuan | ❌ No systemd |
+| Distribution | Init System | Status |
+|---|---|---|
+| Ubuntu 22.04+ / Debian 12+ | systemd | ✅ Tested |
+| Linux Mint / Pop!_OS / Zorin | systemd | ✅ |
+| Fedora 34+ | systemd | ✅ |
+| Arch / Manjaro / EndeavourOS | systemd | ✅ |
+| openSUSE Leap / Tumbleweed | systemd | ✅ |
+| CentOS 7 / RHEL 7 | systemd + yum | ✅ |
+| AlmaLinux / Rocky Linux | systemd | ✅ |
+| Gentoo (systemd profile) | systemd | ✅ |
+| Solus | systemd + eopkg | ✅ |
+| Alpine Linux | OpenRC + apk | ✅ (XDG/crontab fallback) |
+| Void Linux | runit + xbps | ✅ (XDG/crontab fallback) |
+| Devuan | sysvinit/OpenRC | ✅ (XDG/crontab fallback) |
+| Gentoo (OpenRC profile) | OpenRC + emerge | ✅ (XDG/crontab fallback) |
+| Ubuntu 20.04 / Debian 11 | systemd | ⚠️ Requires Python 3.10+ installed manually |
 
 ## Uninstall
 
@@ -82,7 +103,7 @@ curl http://localhost:8000/status
 bash install.sh --uninstall
 ```
 
-Removes the service, virtual environment and all installed files. The source directory is left untouched.
+Removes the service (systemd unit, XDG autostart, or crontab entry), virtual environment, and all installed files. The source directory is left untouched.
 
 ## License
 

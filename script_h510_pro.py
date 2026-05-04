@@ -148,8 +148,9 @@ def enforce_a2dp_profile(card_name: str) -> None:
 
         for line in result.stdout.split("\n"):
             stripped = line.strip()
-            if f"Name: {card_name}" in stripped:
-                in_target = True
+            if stripped.startswith("Name:"):
+                in_target = card_name in stripped
+                continue
             if not in_target:
                 continue
             if stripped.startswith("Active Profile:"):
@@ -194,9 +195,12 @@ async def _play_tone(tone: np.ndarray, sink_name: str) -> None:
         f"--device={sink_name}",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate(input=audio_bytes)
+    _, stderr_data = await proc.communicate(input=audio_bytes)
+    if proc.returncode != 0:
+        err_msg = stderr_data.decode(errors="replace").strip() if stderr_data else ""
+        raise RuntimeError(f"paplay falhou (código {proc.returncode}){': ' + err_msg if err_msg else ''}")
 
 
 async def keep_headset_awake() -> None:
@@ -213,12 +217,10 @@ async def keep_headset_awake() -> None:
             now = time.monotonic()
             mode, card_ref = detect_mode()
 
-            mode_changed = mode != _last_mode
-            if mode_changed:
+            if mode != _last_mode:
                 logger.info(f"Modo de conexão alterado: {_last_mode} → {mode}")
-                _last_mode = mode
-                # Força pulso imediato após troca de modo (ex: dongle → bluetooth)
                 last_pulse_time = float("-inf")
+            _last_mode = mode
 
             pulse_due = (now - last_pulse_time) >= KEEP_ALIVE_INTERVAL_SECONDS
 
