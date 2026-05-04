@@ -88,6 +88,85 @@ API_KEY=$(grep H510_API_KEY ~/.local/share/h510-pro-unlimited/api_key.env | cut 
 curl -X POST -H "X-Api-Key: $API_KEY" http://localhost:8000/toggle
 ```
 
+**`GET /status` response example:**
+```json
+{
+  "status": "ativo",
+  "message": "Monitoramento está ativo. Último modo detectado: bluetooth."
+}
+```
+
+Possible values for `status`: `"ativo"` (running) or `"pausado"` (paused).  
+Possible values for the detected mode in `message`: `bluetooth`, `dongle`, or `não detectado`.
+
+## Configuration
+
+The following constants in `script_h510_pro.py` can be adjusted without breaking anything:
+
+| Constant | Default | Description |
+|---|---|---|
+| `KEEP_ALIVE_INTERVAL_SECONDS` | `480` | Interval between keep-alive pulses (seconds). Must be less than 600 (10 min headset timeout). |
+| `CHECK_INTERVAL_SECONDS` | `60` | How often the service checks for mode changes and enforces A2DP (seconds). |
+| `TONE_FREQUENCY_HZ` | `20` | Frequency of the keep-alive tone. 20Hz is below human hearing range. |
+| `TONE_AMPLITUDE` | `0.08` | Amplitude of the tone (0.0–1.0). Low enough to be inaudible. |
+| `ALSA_PCM_LEVEL` | `13` | ALSA PCM level applied to the dongle card on each pulse cycle. Adjust if dongle volume is too low or too high. |
+| `PORT` | `8000` | Port for the REST API. Also set in `install.sh` (line 20). |
+
+After editing, re-run `bash install.sh` to redeploy with the new values.
+
+## Troubleshooting
+
+**Service fails to start / stays in restart loop**
+```bash
+journalctl --user -u h510-pro-unlimited -f
+```
+Most common cause: PipeWire/PulseAudio not ready when the service starts. The `ExecStartPre=/bin/sleep 10` usually handles this, but on slow machines you may need to increase it in `~/.config/systemd/user/h510-pro-unlimited.service`.
+
+---
+
+**Headset not detected (`Headset não detectado` in logs)**
+
+- Confirm the headset is powered on and connected (dongle inserted or Bluetooth paired).
+- For dongle: check `cat /proc/asound/cards` — the H510-PRO entry must appear.
+- For Bluetooth: check `pactl list cards` — look for a `bluez_card.*` entry with `a2dp` and `available: yes`.
+
+---
+
+**Dongle mode: no audio after installation**
+
+The ALSA PCM fix runs only on pulse cycles (every 8 min). To trigger it immediately, restart the service:
+```bash
+systemctl --user restart h510-pro-unlimited
+```
+
+---
+
+**Bluetooth audio still low quality after installation**
+
+The A2DP enforcement runs every 60 seconds. If it still doesn't switch:
+```bash
+# Check if A2DP is listed as available
+pactl list cards | grep -A 10 bluez_card
+
+# Force manually
+pactl set-card-profile <bluez_card.XX_XX_XX_XX_XX_XX> a2dp_sink
+```
+
+---
+
+**API returns 401 on `/toggle`**
+```bash
+# Retrieve your key
+API_KEY=$(grep H510_API_KEY ~/.local/share/h510-pro-unlimited/api_key.env | cut -d= -f2)
+curl -X POST -H "X-Api-Key: $API_KEY" http://localhost:8000/toggle
+```
+
+---
+
+**Port 8000 already in use**
+
+Edit the `PORT` variable at the top of `install.sh` and in `script_h510_pro.py`, then re-run the installer.
+
 ## Running Tests
 
 ```bash
