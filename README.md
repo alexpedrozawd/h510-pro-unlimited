@@ -76,7 +76,24 @@ curl http://localhost:8000/status
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/status` | Returns current state and detected mode |
-| POST | `/toggle` | Pauses or resumes monitoring |
+| POST | `/toggle` | Pauses or resumes monitoring (requires `X-Api-Key` header) |
+
+The API key is generated automatically during installation and saved in `~/.local/share/h510-pro-unlimited/api_key.env`. It is also displayed at the end of the install output.
+
+```bash
+# Read the key
+API_KEY=$(grep H510_API_KEY ~/.local/share/h510-pro-unlimited/api_key.env | cut -d= -f2)
+
+# Toggle monitoring
+curl -X POST -H "X-Api-Key: $API_KEY" http://localhost:8000/toggle
+```
+
+## Running Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
 
 ## Compatibility
 

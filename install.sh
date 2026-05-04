@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# H510-PRO Unlimited — Instalador v2.0
+# H510-PRO Unlimited — Instalador v2.1
 # Compatível com qualquer distribuição Linux:
 #   systemd  → serviço systemd --user
 #   sem systemd + desktop → XDG autostart (~/.config/autostart)
@@ -17,6 +17,7 @@ SERVICE_NAME="h510-pro-unlimited"
 SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
 XDG_AUTOSTART_FILE="$HOME/.config/autostart/${SERVICE_NAME}.desktop"
 INSTALL_TYPE_FILE="${INSTALL_DIR}/install_type"
+API_KEY_FILE="${INSTALL_DIR}/api_key.env"
 PORT=8000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEGACY_SERVICES=("headset-keeper" "headset-keepalive")
@@ -100,7 +101,29 @@ check_python() {
     ok "Python $ver encontrado."
 }
 
-# ── 2. Dependências do sistema ────────────────────────────────────────────────
+# ── 2. Porta disponível ───────────────────────────────────────────────────────
+check_port() {
+    step "Verificando disponibilidade da porta ${PORT}..."
+
+    local in_use=false
+    if command -v ss &>/dev/null; then
+        ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${PORT}$" && in_use=true || true
+    elif command -v netstat &>/dev/null; then
+        netstat -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${PORT}$" && in_use=true || true
+    fi
+
+    if $in_use; then
+        warn "Porta ${PORT} já está em uso por outro processo."
+        warn "Edite a variável PORT neste script (linha 20) para usar outra porta."
+        printf "Continuar mesmo assim? [s/N] "
+        read -r resp
+        [[ "${resp,,}" =~ ^s$ ]] || exit 1
+    else
+        ok "Porta ${PORT} disponível."
+    fi
+}
+
+# ── 3. Dependências do sistema ────────────────────────────────────────────────
 check_system_deps() {
     step "Verificando dependências do sistema..."
 
@@ -190,7 +213,7 @@ check_system_deps() {
     ok "Dependências do sistema instaladas."
 }
 
-# ── 3. Arquivos e venv Python ─────────────────────────────────────────────────
+# ── 4. Arquivos, venv e API key ───────────────────────────────────────────────
 install_files() {
     step "Instalando arquivos em $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
@@ -201,10 +224,21 @@ install_files() {
     "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
     "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
 
+    # Mantém a chave existente em reinstalações para não invalidar configurações do usuário
+    if [ ! -f "$API_KEY_FILE" ]; then
+        local api_key
+        api_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+        echo "H510_API_KEY=${api_key}" > "$API_KEY_FILE"
+        chmod 600 "$API_KEY_FILE"
+        step "API key gerada e salva em $API_KEY_FILE."
+    else
+        step "API key existente mantida."
+    fi
+
     ok "Arquivos instalados e dependências Python configuradas."
 }
 
-# ── 4. Linger (systemd) ───────────────────────────────────────────────────────
+# ── 5. Linger (systemd) ───────────────────────────────────────────────────────
 _setup_linger() {
     step "Verificando loginctl linger..."
     if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
@@ -218,20 +252,28 @@ _setup_linger() {
     fi
 }
 
-# ── Cria script de inicialização (não-systemd) ────────────────────────────────
+# ── Cria script de inicialização com loop de restart (não-systemd) ────────────
 _write_start_script() {
     cat > "${INSTALL_DIR}/start.sh" << STARTSCRIPT
 #!/usr/bin/env bash
 sleep 10
+set -a
+source "${INSTALL_DIR}/api_key.env"
+set +a
 cd "${INSTALL_DIR}"
-exec "${INSTALL_DIR}/venv/bin/uvicorn" script_h510_pro:app \\
-    --host 127.0.0.1 --port ${PORT} \\
-    >> "${INSTALL_DIR}/h510-pro.log" 2>&1
+while true; do
+    "${INSTALL_DIR}/venv/bin/uvicorn" script_h510_pro:app \\
+        --host 127.0.0.1 --port ${PORT} \\
+        >> "${INSTALL_DIR}/h510-pro.log" 2>&1
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [RESTART] uvicorn encerrado, reiniciando em 5s..." \\
+        >> "${INSTALL_DIR}/h510-pro.log"
+    sleep 5
+done
 STARTSCRIPT
     chmod +x "${INSTALL_DIR}/start.sh"
 }
 
-# ── 5a. Serviço: systemd ──────────────────────────────────────────────────────
+# ── 6a. Serviço: systemd ──────────────────────────────────────────────────────
 _install_service_systemd() {
     step "Configurando serviço systemd..."
 
@@ -257,6 +299,7 @@ Wants=pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
+EnvironmentFile=${INSTALL_DIR}/api_key.env
 Environment="PYTHONUNBUFFERED=1"
 WorkingDirectory=${INSTALL_DIR}
 ExecStartPre=/bin/sleep 10
@@ -282,7 +325,7 @@ EOF
     ok "Serviço systemd '${SERVICE_NAME}' instalado, habilitado e iniciado."
 }
 
-# ── 5b. Serviço: XDG autostart ───────────────────────────────────────────────
+# ── 6b. Serviço: XDG autostart ───────────────────────────────────────────────
 _install_service_xdg() {
     step "Configurando XDG autostart (systemd não disponível)..."
 
@@ -308,7 +351,7 @@ EOF
     ok "XDG autostart configurado. O serviço inicia com a sessão gráfica e já está rodando."
 }
 
-# ── 5c. Serviço: crontab @reboot ─────────────────────────────────────────────
+# ── 6c. Serviço: crontab @reboot ─────────────────────────────────────────────
 _install_service_crontab() {
     step "Configurando @reboot via crontab (fallback universal)..."
 
@@ -329,7 +372,7 @@ _install_service_crontab() {
     ok "Serviço iniciado em background."
 }
 
-# ── 5. Dispatcher de serviço ──────────────────────────────────────────────────
+# ── 6. Dispatcher de serviço ──────────────────────────────────────────────────
 install_service() {
     if has_systemd; then
         _install_service_systemd
@@ -347,14 +390,19 @@ fi
 
 echo ""
 echo -e "${BLU}${BOLD}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BLU}${BOLD}║   H510-PRO Unlimited — Instalador v2.0   ║${NC}"
+echo -e "${BLU}${BOLD}║   H510-PRO Unlimited — Instalador v2.1   ║${NC}"
 echo -e "${BLU}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 check_python
+check_port
 check_system_deps
 install_files
 install_service
+
+# Exibe a API key gerada
+API_KEY_VALUE=""
+[ -f "$API_KEY_FILE" ] && API_KEY_VALUE=$(cut -d= -f2 "$API_KEY_FILE")
 
 echo ""
 echo -e "${GRN}${BOLD}✓ Instalação concluída com sucesso!${NC}"
@@ -367,5 +415,7 @@ else
     echo -e "  ${BOLD}Ver logs:${NC}          tail -f ${INSTALL_DIR}/h510-pro.log"
 fi
 echo -e "  ${BOLD}API de status:${NC}     curl http://localhost:${PORT}/status"
+echo -e "  ${BOLD}API key:${NC}           ${API_KEY_VALUE}"
+echo -e "  ${BOLD}Pausar/retomar:${NC}    curl -X POST -H \"X-Api-Key: ${API_KEY_VALUE}\" http://localhost:${PORT}/toggle"
 echo -e "  ${BOLD}Desinstalar:${NC}       bash install.sh --uninstall"
 echo ""
