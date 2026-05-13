@@ -18,6 +18,8 @@ SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
 XDG_AUTOSTART_FILE="$HOME/.config/autostart/${SERVICE_NAME}.desktop"
 INSTALL_TYPE_FILE="${INSTALL_DIR}/install_type"
 API_KEY_FILE="${INSTALL_DIR}/api_key.env"
+WP_CONFIG_DIR="$HOME/.config/wireplumber/main.lua.d"
+WP_CONFIG_FILE="${WP_CONFIG_DIR}/51-h510-mic-fix.lua"
 PORT=8000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEGACY_SERVICES=("headset-keeper" "headset-keepalive")
@@ -37,6 +39,13 @@ uninstall() {
 
     local install_type=""
     [ -f "$INSTALL_TYPE_FILE" ] && install_type=$(cat "$INSTALL_TYPE_FILE" 2>/dev/null || true)
+
+    # WirePlumber mic-fix rule
+    if [ -f "$WP_CONFIG_FILE" ]; then
+        rm -f "$WP_CONFIG_FILE"
+        systemctl --user restart wireplumber 2>/dev/null || true
+        step "Regra WirePlumber removida."
+    fi
 
     # systemd
     if [ "$install_type" = "systemd" ] || { [ -z "$install_type" ] && has_systemd; }; then
@@ -211,6 +220,32 @@ check_system_deps() {
     fi
 
     ok "Dependências do sistema instaladas."
+}
+
+# ── 4b. WirePlumber mic-fix (0.4.x) ──────────────────────────────────────────
+install_wireplumber_config() {
+    if ! command -v wireplumber &>/dev/null; then
+        warn "WirePlumber não encontrado — regra de mic não instalada."
+        return
+    fi
+
+    local wp_minor
+    wp_minor=$(wireplumber --version 2>/dev/null | grep -oP '0\.\K\d+' | head -1)
+    if [ -z "$wp_minor" ] || [ "$wp_minor" -ge 5 ]; then
+        warn "WirePlumber 0.${wp_minor:-?} detectado — regra Lua só é suportada no 0.4.x (skipped)."
+        return
+    fi
+
+    step "Instalando regra WirePlumber em $WP_CONFIG_FILE..."
+    mkdir -p "$WP_CONFIG_DIR"
+    cp "$SCRIPT_DIR/wireplumber/51-h510-mic-fix.lua" "$WP_CONFIG_FILE"
+
+    if systemctl --user is-active wireplumber.service &>/dev/null 2>&1; then
+        systemctl --user restart wireplumber
+        sleep 2
+    fi
+
+    ok "Regra WirePlumber instalada — microfone do H510-PRO iniciará em 100% a cada conexão."
 }
 
 # ── 4. Arquivos, venv e API key ───────────────────────────────────────────────
@@ -397,6 +432,7 @@ echo ""
 check_python
 check_port
 check_system_deps
+install_wireplumber_config
 install_files
 install_service
 

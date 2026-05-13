@@ -9,8 +9,18 @@ A Linux fix for the **Redragon Zeus Pro 7.1 Wireless (H510-PRO)** headset that s
 | Headset auto-shuts off after 10 min of silence | Sends an inaudible 20Hz keep-alive pulse every 8 minutes |
 | Bluetooth audio sounds low quality | Automatically enforces the A2DP (high-fidelity) profile |
 | Dongle (2.4GHz) mode starts muted | Resets ALSA PCM levels on every pulse cycle |
+| **Mic is silent on every USB connect (dongle or cable)** | **WirePlumber rule forces `Mic` to 100% via `HW_VOLUME_CTRL` on device connect** |
+| **Bluetooth mic doesn't work in calls (Meet, Teams, etc.)** | **WirePlumber auto-switches A2DP → HFP when a communication stream appears (built-in)** |
 
 ## How It Works
+
+**WirePlumber rule (always installed):**
+
+A Lua rule injected into WirePlumber that fires whenever the H510-PRO appears on ALSA (USB dongle or cable). The headset firmware initialises `Mic,0 = 0` every time it connects; the rule overrides that to `1.0` (100%) via `HW_VOLUME_CTRL`, so the mic is ready immediately without manual intervention.
+
+For Bluetooth calls: WirePlumber's built-in `policy-bluetooth` already auto-switches from A2DP to HFP when a communication stream (Google Meet, Teams, etc.) requests the microphone, then reverts to A2DP when the call ends. No extra configuration needed.
+
+**Python keep-alive service (installed alongside the rule):**
 
 A lightweight Python service runs in the background and:
 
@@ -22,11 +32,13 @@ A lightweight Python service runs in the background and:
 ## Requirements
 
 - Linux (any distribution — see compatibility table below)
-- **Python 3.10+**
+- **WirePlumber 0.4.x** — for the mic-fix rule (check with `wireplumber --version`)
+- **Python 3.10+** — for the keep-alive service
 - **PipeWire** or **PulseAudio** (most modern desktop distros include one of these)
 - `amixer` (`alsa-utils`) and `paplay` / `pactl` (`pulseaudio-utils` or `pipewire-pulse`)
 
 > The installer detects your package manager and installs missing dependencies automatically.
+> The WirePlumber rule is skipped automatically on WirePlumber 0.5+.
 
 ## Installation
 
@@ -37,11 +49,12 @@ bash install.sh
 ```
 
 The installer will:
-1. Verify Python 3.10+
-2. Detect your package manager and install missing system dependencies
-3. Create an isolated Python virtual environment
-4. Install Python dependencies (pinned versions)
-5. Register and start the service using the best available method for your system
+1. Install the WirePlumber mic-fix rule (`~/.config/wireplumber/main.lua.d/51-h510-mic-fix.lua`)
+2. Verify Python 3.10+
+3. Detect your package manager and install missing system dependencies
+4. Create an isolated Python virtual environment
+5. Install Python dependencies (pinned versions)
+6. Register and start the keep-alive service using the best available method for your system
 
 ## Service Installation Strategy
 
@@ -113,6 +126,23 @@ The following constants in `script_h510_pro.py` can be adjusted without breaking
 | `PORT` | `8000` | Port for the REST API. Also set in `install.sh` (line 20). |
 
 After editing, re-run `bash install.sh` to redeploy with the new values.
+
+## WirePlumber Mic Fix
+
+The rule at `wireplumber/51-h510-mic-fix.lua` is copied by the installer to `~/.config/wireplumber/main.lua.d/`. It matches any ALSA input node from XiiSound/H510-PRO and applies `node.volume = 1.0` at creation time, which WirePlumber writes back to the hardware mixer via `HW_VOLUME_CTRL`.
+
+This covers both connection modes:
+- **USB Dongle (2.4GHz):** node name matches `alsa_input.usb-XiiSound*`
+- **USB Cable (direct):** same USB IDs, same node name pattern
+
+**Bluetooth mic (HFP):** handled natively by WirePlumber — no rule needed. As long as `media-role.use-headset-profile = true` is set (default in WirePlumber 0.4.x) and the app appears in the `media-role.applications` list (`Google Chrome input`, `WEBRTC VoiceEngine`, etc.), WirePlumber switches the profile automatically when a call starts.
+
+To reinstall the rule manually without reinstalling the full service:
+```bash
+mkdir -p ~/.config/wireplumber/main.lua.d
+cp wireplumber/51-h510-mic-fix.lua ~/.config/wireplumber/main.lua.d/
+systemctl --user restart wireplumber
+```
 
 ## Troubleshooting
 
@@ -199,7 +229,7 @@ pytest tests/ -v
 bash install.sh --uninstall
 ```
 
-Removes the service (systemd unit, XDG autostart, or crontab entry), virtual environment, and all installed files. The source directory is left untouched.
+Removes the WirePlumber rule, the service (systemd unit, XDG autostart, or crontab entry), virtual environment, and all installed files. The source directory is left untouched.
 
 ## License
 
