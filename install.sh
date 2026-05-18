@@ -143,6 +143,9 @@ check_system_deps() {
     _check_bin amixer
     _check_bin pactl
     _check_bin paplay
+    _check_bin alsactl
+    _check_bin pw-loopback
+    _check_bin pw-link
     python3 -m venv --help &>/dev/null 2>&1 || missing_bins+=("python3-venv")
 
     if [ ${#missing_bins[@]} -eq 0 ]; then
@@ -153,66 +156,78 @@ check_system_deps() {
     warn "Dependências faltando: ${missing_bins[*]}"
     step "Instalando dependências do sistema..."
 
+    local need_pw_tools=false
+    [[ " ${missing_bins[*]} " =~ pw-loopback || " ${missing_bins[*]} " =~ pw-link ]] && need_pw_tools=true
+
     if command -v apt-get &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3-venv)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pulseaudio-utils)
+        $need_pw_tools && pkgs+=(pipewire-bin)
         sudo apt-get update -qq && sudo apt-get install -y "${pkgs[@]}"
 
     elif command -v dnf &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pipewire-utils)
+        $need_pw_tools && pkgs+=(pipewire-utils)
         sudo dnf install -y "${pkgs[@]}"
 
     elif command -v yum &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pulseaudio-utils)
+        $need_pw_tools && pkgs+=(pipewire-utils)
         sudo yum install -y "${pkgs[@]}"
 
     elif command -v pacman &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(libpulse)
+        $need_pw_tools && pkgs+=(pipewire)
         sudo pacman -S --noconfirm "${pkgs[@]}"
 
     elif command -v zypper &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pulseaudio-utils)
+        $need_pw_tools && pkgs+=(pipewire-tools)
         sudo zypper install -y "${pkgs[@]}"
 
     elif command -v apk &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3 py3-pip)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pipewire-pulse)
+        $need_pw_tools && pkgs+=(pipewire-tools)
         sudo apk add --no-cache "${pkgs[@]}"
 
     elif command -v xbps-install &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pipewire-pulse)
+        $need_pw_tools && pkgs+=(pipewire)
         sudo xbps-install -Sy "${pkgs[@]}"
 
     elif command -v eopkg &>/dev/null; then
         local pkgs=()
         [[ " ${missing_bins[*]} " =~ python3-venv ]] && pkgs+=(python3)
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(pipewire)
+        $need_pw_tools && pkgs+=(pipewire)
         sudo eopkg install -y "${pkgs[@]}"
 
     elif command -v emerge &>/dev/null; then
         local pkgs=()
-        [[ " ${missing_bins[*]} " =~ amixer ]]        && pkgs+=(media-sound/alsa-utils)
+        [[ " ${missing_bins[*]} " =~ amixer || " ${missing_bins[*]} " =~ alsactl ]] && pkgs+=(media-sound/alsa-utils)
         [[ " ${missing_bins[*]} " =~ pactl || " ${missing_bins[*]} " =~ paplay ]] && pkgs+=(media-video/pipewire)
+        $need_pw_tools && pkgs+=(media-video/pipewire)
         sudo emerge --ask=n "${pkgs[@]}"
 
     else

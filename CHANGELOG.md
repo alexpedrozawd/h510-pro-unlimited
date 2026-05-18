@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [1.3.0] — 2026-05-18
+
+### Fixed
+- **L/R imbalance and volume not lowering**: PipeWire was using the H510-PRO's hardware mixer (`HW_VOLUME_CTRL`), but the device exposes only "fake" volume controls with a dB range of just **0.39 dB** — too small for real attenuation. Any volume below 100% mapped to `PCM,0 = 0,0`, while `PCM,1` (a mono pre-amp that bleeds into one transducer) stayed at its previous value. Result: at any volume < 100%, sound came out of one side only.
+- Solution combines three layers:
+  1. **Event-driven ALSA watchdog** (`alsactl monitor` + 100 ms debounce) keeps `PCM,0` and `PCM,1` at 100% in the hardware, reacting in under 200 ms to any external write.
+  2. **Virtual sink** `h510-soft` created via `pw-loopback` — exposes a sink with no `HW_VOLUME_CTRL` flag, so PipeWire is forced to attenuate in software before the audio reaches the hardware (which is always at 100%).
+  3. **Auto-routing**: when the dongle is detected, the service makes `h510-soft` the default sink and migrates active sink-inputs to it. When the dongle disconnects, the previous default is restored and the loopback is stopped.
+
+### Added
+- `pw-loopback`, `pw-link` and `alsactl` added to the dependency checks in `install.sh` (mapped to the appropriate package for each supported distro).
+
+---
+
 ## [1.2.0] — 2026-05-13
 
 ### Added

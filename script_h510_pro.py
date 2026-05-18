@@ -27,16 +27,25 @@ TONE_FREQUENCY_HZ = 20
 TONE_AMPLITUDE = 0.08
 TONE_DURATION_S = 0.5
 SAMPLE_RATE = 48000
-# H510-PRO expõe dois controles 'PCM' no ALSA: PCM,0 (stereo L/R) e PCM,1 (mono pre-amp).
-# PipeWire usa HW_VOLUME_CTRL e acaba escrevendo em PCM,1 — se ele estiver atenuado,
-# o áudio sai desbalanceado (um lado mais alto que o outro). Mantemos ambos em 100%.
+# Controles PCM,0 e PCM,1 do H510-PRO tem range de apenas 0.39dB (sao "fake" controls
+# que so funcionam como mute/unmute). Por isso o PipeWire ao tentar atenuar acaba
+# escrevendo 0 no PCM,0, silenciando um lado. Mantemos ambos em 100% e roteamos o
+# audio via sink virtual pw-loopback (volume puramente software).
 ALSA_PCM_LEVEL = 100
+
+# Sink virtual criado via pw-loopback: aceita audio com volume software puro e o
+# encaminha ao H510-PRO real fixo em 100%. Os flags HW_VOLUME_CTRL/HW_MUTE_CTRL
+# nao aparecem nele, entao o PipeWire e obrigado a atenuar em software.
+LOOPBACK_SINK_NAME = "h510-soft"
+LOOPBACK_DESCRIPTION = "H510-PRO (Software Volume)"
 
 # Quando definida, /toggle exige o header X-Api-Key com esse valor
 API_KEY: str = os.environ.get("H510_API_KEY", "")
 
 is_running = True
 _last_mode: str | None = None
+_loopback_proc: asyncio.subprocess.Process | None = None
+_previous_default_sink: str | None = None
 
 
 def _detect_dongle_card_id() -> str | None:
@@ -133,17 +142,102 @@ def _get_headset_sink(mode: str) -> str | None:
     return None
 
 
-def fix_alsa_levels(card_id: str) -> None:
+def _pcm_levels_already_max(card_id: str) -> bool:
+    """Retorna True se PCM,0 (numid=9) e PCM,1 (numid=10) já estão em 100% — evita
+    escrita desnecessária e quebra o loop de eco no watchdog event-driven."""
+    try:
+        r1 = subprocess.run(
+            ["amixer", "-c", card_id, "cget", "numid=9"],
+            capture_output=True, text=True, timeout=2, env=_PACTL_ENV,
+        )
+        if r1.returncode != 0 or not re.search(r"values=100,100", r1.stdout):
+            return False
+        r2 = subprocess.run(
+            ["amixer", "-c", card_id, "cget", "numid=10"],
+            capture_output=True, text=True, timeout=2, env=_PACTL_ENV,
+        )
+        return r2.returncode == 0 and bool(re.search(r"values=100", r2.stdout))
+    except Exception:
+        return False
+
+
+def fix_alsa_levels(card_id: str, quiet: bool = False) -> None:
     """Equaliza PCM,0 (stereo) e PCM,1 (mono) em 100% e desmuta — evita o desbalanço L/R
-    causado pelo PipeWire ao escrever via HW_VOLUME_CTRL apenas em um dos dois controles."""
+    causado pelo PipeWire ao escrever via HW_VOLUME_CTRL apenas em um dos dois controles.
+    Com quiet=True, loga em DEBUG (usado pelo watchdog para não poluir o journal)."""
     try:
         subprocess.run(["amixer", "-c", card_id, "sset", "PCM,0", str(ALSA_PCM_LEVEL), "unmute"], capture_output=True, timeout=2)
         subprocess.run(["amixer", "-c", card_id, "sset", "PCM,1", str(ALSA_PCM_LEVEL), "unmute"], capture_output=True, timeout=2)
-        logger.info(f"ALSA: PCM,0 e PCM,1 sincronizados na placa {card_id} (nível {ALSA_PCM_LEVEL}).")
+        log = logger.debug if quiet else logger.info
+        log(f"ALSA: PCM,0 e PCM,1 sincronizados na placa {card_id} (nível {ALSA_PCM_LEVEL}).")
     except subprocess.TimeoutExpired:
         logger.error("ALSA: timeout — hardware ocupado.")
     except Exception as e:
         logger.error(f"ALSA: erro ao ajustar níveis: {e}")
+
+
+async def _alsa_watchdog(card_id: str) -> None:
+    """Subscribe a eventos do mixer ALSA via `alsactl monitor` e re-aplica PCM,0=PCM,1=100%
+    sempre que algo mexe nos controles, com debounce de 100ms para agrupar rajadas.
+
+    Necessário porque o PipeWire usa HW_VOLUME_CTRL e ao baixar volume escreve PCM,0=0,0
+    enquanto PCM,1 permanece em 100% — o que silencia o canal direito (PCM,1 é o pre-amp
+    do esquerdo) e gera o áudio só-no-esquerdo. Mantendo ambos em 100%, o controle de
+    volume vira efetivamente software (PipeWire escala o sample antes do hardware).
+
+    O debounce é crítico: arrastar o slider gera 5-10 eventos em <100ms, e queremos
+    aplicar a fix UMA VEZ no estado final — não durante a rajada (poderia ser ignorada
+    pelo próximo evento da rajada).
+    """
+    fix_alsa_levels(card_id)  # estado inicial: firmware pode iniciar PCM,1=13%
+
+    proc = await asyncio.create_subprocess_exec(
+        "alsactl", "monitor", f"hw:{card_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break  # alsactl morreu — dongle desconectou
+            if b"PCM Playback Volume" not in line:
+                continue
+            # Drena a rajada — espera 100ms sem novos eventos antes de aplicar.
+            # readline() cancelado por wait_for preserva bytes parciais no buffer interno.
+            while True:
+                try:
+                    next_line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    break
+                if not next_line:
+                    return  # stream encerrou no meio da rajada
+            if not _pcm_levels_already_max(card_id):
+                fix_alsa_levels(card_id, quiet=True)
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                proc.kill()
+
+
+async def alsa_watchdog_loop() -> None:
+    """Loop persistente: aguarda o dongle aparecer, roda o watchdog, reinicia se o
+    dongle desconectar ou se o alsactl falhar."""
+    while True:
+        card_id = _detect_dongle_card_id()
+        if not card_id:
+            await asyncio.sleep(5)
+            continue
+        try:
+            await _alsa_watchdog(card_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Watchdog ALSA: erro inesperado ({e}). Reiniciando em 5s.")
+        await asyncio.sleep(5)
 
 
 def enforce_a2dp_profile(card_name: str, cards_output: str | None = None) -> None:
@@ -190,6 +284,150 @@ def enforce_a2dp_profile(card_name: str, cards_output: str | None = None) -> Non
         logger.error(f"Bluetooth: erro ao forçar A2DP: {e}")
 
 
+async def _pactl_async(*args: str) -> tuple[int, bytes]:
+    """Helper para invocar pactl async retornando (returncode, stdout)."""
+    proc = await asyncio.create_subprocess_exec(
+        "pactl", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=_PACTL_ENV,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out
+
+
+async def _move_inputs_to_sink(sink_name: str) -> None:
+    """Move todos os sink-inputs ativos para o sink especificado.
+    Aplicações que já estavam tocando precisam ser movidas explicitamente — não basta
+    mudar o default sink (apps com sink fixado ignoram a troca)."""
+    rc, out = await _pactl_async("list", "sink-inputs", "short")
+    if rc != 0:
+        return
+    for line in out.decode(errors="replace").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        await _pactl_async("move-sink-input", parts[0], sink_name)
+
+
+async def _pw_run(*args: str) -> tuple[int, bytes]:
+    """Helper para invocar utilitários pipewire (pw-link, etc) e retornar (rc, stdout)."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out
+
+
+async def _relink_loopback_to_target(loopback_pid: int, target_sink_name: str) -> bool:
+    """Reconecta os outputs do pw-loopback ao sink alvo. Necessário porque o pw-loopback
+    frequentemente auto-linka ao sink default no startup (autofalante interno) e ignora
+    o -P/node.target. Listamos os links atuais, desconectamos os errados e refazemos."""
+    loopback_node = f"output.pw-loopback-{loopback_pid}"
+    rc, out = await _pw_run("pw-link", "-l")
+    if rc != 0:
+        return False
+
+    # Parseia: linhas começando com "alsa_output...:playback_FL" indicam input ports;
+    # linhas com "  |<- output.pw-loopback-<pid>:output_FX" indicam de onde vem o sinal.
+    current_input: str | None = None
+    wrong_links: list[tuple[str, str]] = []  # (out_port, in_port) a desconectar
+    for line in out.decode(errors="replace").splitlines():
+        if line.startswith(" "):
+            stripped = line.strip()
+            if stripped.startswith("|<-") and loopback_node in stripped:
+                src = stripped[3:].strip()
+                if current_input and not current_input.startswith(target_sink_name + ":"):
+                    wrong_links.append((src, current_input))
+        else:
+            current_input = line.strip()
+
+    # Desconecta links errados
+    for src, dst in wrong_links:
+        await _pw_run("pw-link", "-d", src, dst)
+
+    # Cria links corretos
+    for ch in ("FL", "FR"):
+        await _pw_run("pw-link", f"{loopback_node}:output_{ch}", f"{target_sink_name}:playback_{ch}")
+    return True
+
+
+async def _start_loopback(target_sink_name: str) -> bool:
+    """Inicia pw-loopback criando o sink virtual h510-soft e o define como default.
+    Returns True se inicializou (ou já estava rodando)."""
+    global _loopback_proc, _previous_default_sink
+
+    if _loopback_proc and _loopback_proc.returncode is None:
+        return True
+
+    try:
+        _loopback_proc = await asyncio.create_subprocess_exec(
+            "pw-loopback",
+            "--capture-props",
+            f"media.class=Audio/Sink node.name={LOOPBACK_SINK_NAME} "
+            f"node.description=\"{LOOPBACK_DESCRIPTION}\" audio.position=[FL,FR]",
+            "--playback-props",
+            "audio.position=[FL,FR] node.passive=true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        logger.error("Loopback: pw-loopback não encontrado. Instale pipewire-tools/utils.")
+        return False
+    except Exception as e:
+        logger.error(f"Loopback: erro ao iniciar pw-loopback: {e}")
+        return False
+
+    # Aguarda o sink virtual aparecer no PipeWire
+    for _ in range(20):
+        await asyncio.sleep(0.15)
+        rc, out = await _pactl_async("list", "sinks", "short")
+        if rc == 0 and LOOPBACK_SINK_NAME.encode() in out:
+            break
+    else:
+        logger.error(f"Loopback: sink virtual '{LOOPBACK_SINK_NAME}' não apareceu após 3s.")
+        return False
+
+    # Garante que o playback do loopback aponta para o H510 e não para o default antigo
+    await _relink_loopback_to_target(_loopback_proc.pid, target_sink_name)
+
+    # Lembra o default anterior para restaurar quando o dongle desconectar
+    rc, out = await _pactl_async("get-default-sink")
+    if rc == 0:
+        current = out.decode(errors="replace").strip()
+        if current and current != LOOPBACK_SINK_NAME:
+            _previous_default_sink = current
+
+    await _pactl_async("set-default-sink", LOOPBACK_SINK_NAME)
+    await _move_inputs_to_sink(LOOPBACK_SINK_NAME)
+    logger.info(f"Loopback iniciado: {LOOPBACK_SINK_NAME} → {target_sink_name}.")
+    return True
+
+
+async def _stop_loopback() -> None:
+    """Encerra o pw-loopback e restaura o sink default anterior."""
+    global _loopback_proc, _previous_default_sink
+
+    if _previous_default_sink:
+        await _pactl_async("set-default-sink", _previous_default_sink)
+        _previous_default_sink = None
+
+    if _loopback_proc is None or _loopback_proc.returncode is not None:
+        _loopback_proc = None
+        return
+
+    _loopback_proc.terminate()
+    try:
+        await asyncio.wait_for(_loopback_proc.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        _loopback_proc.kill()
+        await _loopback_proc.wait()
+    logger.info("Loopback parado.")
+    _loopback_proc = None
+
+
 async def _play_tone(tone: np.ndarray, sink_name: str) -> None:
     """
     Envia o tom diretamente ao sink PipeWire especificado via paplay.
@@ -234,16 +472,20 @@ async def keep_headset_awake() -> None:
             if mode != _last_mode:
                 logger.info(f"Modo de conexão alterado: {_last_mode} → {mode}")
                 last_pulse_time = float("-inf")
+                # Encerra o loopback quando sair do modo dongle (Bluetooth tem seu próprio path)
+                if _last_mode == "dongle" and mode != "dongle":
+                    await _stop_loopback()
             _last_mode = mode
 
             pulse_due = (now - last_pulse_time) >= KEEP_ALIVE_INTERVAL_SECONDS
 
             if mode == "dongle":
-                # PCM,1 é resetado pelo firmware em wake/conexão e às vezes pelo PipeWire
-                # ao mexer no volume — refresca a cada ciclo (60s) para manter L/R balanceado.
-                fix_alsa_levels(card_ref)
+                # Volume/balance é responsabilidade do alsa_watchdog_loop (event-driven) +
+                # sink virtual pw-loopback (que aceita volume software puro).
+                sink = _get_headset_sink("dongle")
+                if sink is not None:
+                    await _start_loopback(sink)
                 if pulse_due:
-                    sink = _get_headset_sink("dongle")
                     if sink is not None:
                         try:
                             await _play_tone(inaudible_tone, sink)
@@ -277,13 +519,17 @@ async def keep_headset_awake() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(keep_headset_awake())
+    keepalive_task = asyncio.create_task(keep_headset_awake())
+    watchdog_task = asyncio.create_task(alsa_watchdog_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    keepalive_task.cancel()
+    watchdog_task.cancel()
+    for t in (keepalive_task, watchdog_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    await _stop_loopback()
 
 
 app = FastAPI(title="Headset Keep-Alive & Auto-Mixer API", lifespan=lifespan)
