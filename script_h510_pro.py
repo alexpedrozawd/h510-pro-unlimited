@@ -27,7 +27,10 @@ TONE_FREQUENCY_HZ = 20
 TONE_AMPLITUDE = 0.08
 TONE_DURATION_S = 0.5
 SAMPLE_RATE = 48000
-ALSA_PCM_LEVEL = 13
+# H510-PRO expõe dois controles 'PCM' no ALSA: PCM,0 (stereo L/R) e PCM,1 (mono pre-amp).
+# PipeWire usa HW_VOLUME_CTRL e acaba escrevendo em PCM,1 — se ele estiver atenuado,
+# o áudio sai desbalanceado (um lado mais alto que o outro). Mantemos ambos em 100%.
+ALSA_PCM_LEVEL = 100
 
 # Quando definida, /toggle exige o header X-Api-Key com esse valor
 API_KEY: str = os.environ.get("H510_API_KEY", "")
@@ -131,12 +134,12 @@ def _get_headset_sink(mode: str) -> str | None:
 
 
 def fix_alsa_levels(card_id: str) -> None:
-    """Equaliza PCM/PCM1 e garante que o canal não esteja mudo (workaround dongle mudo)."""
+    """Equaliza PCM,0 (stereo) e PCM,1 (mono) em 100% e desmuta — evita o desbalanço L/R
+    causado pelo PipeWire ao escrever via HW_VOLUME_CTRL apenas em um dos dois controles."""
     try:
-        subprocess.run(["amixer", "-c", card_id, "sset", "PCM", str(ALSA_PCM_LEVEL)], capture_output=True, timeout=2)
-        subprocess.run(["amixer", "-c", card_id, "sset", "PCM1", str(ALSA_PCM_LEVEL)], capture_output=True, timeout=2)
-        subprocess.run(["amixer", "-c", card_id, "sset", "PCM", "unmute"], capture_output=True, timeout=2)
-        logger.info(f"ALSA: PCM e PCM1 sincronizados na placa {card_id} (nível {ALSA_PCM_LEVEL}).")
+        subprocess.run(["amixer", "-c", card_id, "sset", "PCM,0", str(ALSA_PCM_LEVEL), "unmute"], capture_output=True, timeout=2)
+        subprocess.run(["amixer", "-c", card_id, "sset", "PCM,1", str(ALSA_PCM_LEVEL), "unmute"], capture_output=True, timeout=2)
+        logger.info(f"ALSA: PCM,0 e PCM,1 sincronizados na placa {card_id} (nível {ALSA_PCM_LEVEL}).")
     except subprocess.TimeoutExpired:
         logger.error("ALSA: timeout — hardware ocupado.")
     except Exception as e:
@@ -236,8 +239,10 @@ async def keep_headset_awake() -> None:
             pulse_due = (now - last_pulse_time) >= KEEP_ALIVE_INTERVAL_SECONDS
 
             if mode == "dongle":
+                # PCM,1 é resetado pelo firmware em wake/conexão e às vezes pelo PipeWire
+                # ao mexer no volume — refresca a cada ciclo (60s) para manter L/R balanceado.
+                fix_alsa_levels(card_ref)
                 if pulse_due:
-                    fix_alsa_levels(card_ref)
                     sink = _get_headset_sink("dongle")
                     if sink is not None:
                         try:
