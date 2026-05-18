@@ -8,9 +8,10 @@ A Linux fix for the **Redragon Zeus Pro 7.1 Wireless (H510-PRO)** headset that s
 |---|---|
 | Headset auto-shuts off after 10 min of silence | Sends an inaudible 20Hz keep-alive pulse every 8 minutes |
 | Bluetooth audio sounds low quality | Automatically enforces the A2DP (high-fidelity) profile |
-| Dongle (2.4GHz) mode starts muted | Resets ALSA PCM levels on every pulse cycle |
-| **Mic is silent on every USB connect (dongle or cable)** | **WirePlumber rule forces `Mic` to 100% via `HW_VOLUME_CTRL` on device connect** |
-| **Bluetooth mic doesn't work in calls (Meet, Teams, etc.)** | **WirePlumber auto-switches A2DP → HFP when a communication stream appears (built-in)** |
+| Dongle (2.4GHz) mode starts muted | Resets ALSA PCM levels on dongle detection |
+| Mic is silent on every USB connect (dongle or cable) | WirePlumber rule forces `Mic` to 100% via `HW_VOLUME_CTRL` on device connect |
+| Bluetooth mic doesn't work in calls (Meet, Teams, etc.) | WirePlumber auto-switches A2DP → HFP when a communication stream appears (built-in) |
+| **Audio plays only on the left side when volume is below 100%** | **Virtual sink `h510-soft` (via `pw-loopback`) forces volume control to software; ALSA watchdog locks `PCM,0`/`PCM,1` at 100% on the hardware** |
 
 ## How It Works
 
@@ -29,13 +30,23 @@ A lightweight Python service runs in the background and:
 - Sends a keep-alive audio pulse directly to the headset's PipeWire/PulseAudio sink — without interrupting other audio streams
 - Exposes a small REST API (`/status`, `/toggle`) for quick monitoring
 
+**Virtual sink + ALSA watchdog (dongle mode only):**
+
+The H510-PRO exposes two ALSA volume controls (`PCM,0` stereo, `PCM,1` mono pre-amp) but both have a dB range of only **0.39 dB** — they work as mute/unmute, not real volume controls. When PipeWire tries to attenuate via `HW_VOLUME_CTRL`, it ends up muting `PCM,0` while `PCM,1` stays at its previous value, causing audio to play only on the left side.
+
+The service works around this in two layers:
+
+1. **`alsactl monitor` watchdog** — subscribes to mixer events, debounces 100 ms of rapid changes (volume slider drag), then forces both `PCM,0` and `PCM,1` back to 100% in the hardware.
+2. **`pw-loopback` virtual sink `h510-soft`** — a sink that does **not** expose `HW_VOLUME_CTRL`, so PipeWire is forced to attenuate in software before the audio reaches the hardware (which is locked at 100% by the watchdog). When the dongle is detected, the service makes `h510-soft` the default sink and migrates any already-playing streams to it. When the dongle disconnects, the previous default is restored and the loopback is stopped.
+
 ## Requirements
 
 - Linux (any distribution — see compatibility table below)
 - **WirePlumber 0.4.x** — for the mic-fix rule (check with `wireplumber --version`)
 - **Python 3.10+** — for the keep-alive service
-- **PipeWire** or **PulseAudio** (most modern desktop distros include one of these)
-- `amixer` (`alsa-utils`) and `paplay` / `pactl` (`pulseaudio-utils` or `pipewire-pulse`)
+- **PipeWire** (required for the virtual sink and `pw-loopback`/`pw-link` utilities; PulseAudio-only setups will not get the L/R balance fix)
+- `amixer` + `alsactl` (`alsa-utils`) and `paplay` / `pactl` (`pulseaudio-utils` or `pipewire-pulse`)
+- `pw-loopback` + `pw-link` (`pipewire-bin` on Debian/Ubuntu, `pipewire-utils` on Fedora, `pipewire` on Arch — installed automatically)
 
 > The installer detects your package manager and installs missing dependencies automatically.
 > The WirePlumber rule is skipped automatically on WirePlumber 0.5+.
@@ -51,10 +62,18 @@ bash install.sh
 The installer will:
 1. Install the WirePlumber mic-fix rule (`~/.config/wireplumber/main.lua.d/51-h510-mic-fix.lua`)
 2. Verify Python 3.10+
-3. Detect your package manager and install missing system dependencies
+3. Detect your package manager and install missing system dependencies (including `pw-loopback`/`pw-link` for the virtual sink)
 4. Create an isolated Python virtual environment
 5. Install Python dependencies (pinned versions)
 6. Register and start the keep-alive service using the best available method for your system
+
+Once running, the service will (when the dongle is plugged in):
+- Spawn the `h510-soft` virtual sink and set it as the system default
+- Start the ALSA watchdog that keeps the hardware mixer locked at 100%
+- Migrate any already-playing audio streams to the new sink
+- Begin the 8-minute keep-alive pulse cycle to prevent the headset from auto-shutting down
+
+All of these are torn down automatically when the dongle is removed, and the previous default sink is restored.
 
 ## Service Installation Strategy
 
@@ -122,7 +141,9 @@ The following constants in `script_h510_pro.py` can be adjusted without breaking
 | `CHECK_INTERVAL_SECONDS` | `60` | How often the service checks for mode changes and enforces A2DP (seconds). |
 | `TONE_FREQUENCY_HZ` | `20` | Frequency of the keep-alive tone. 20Hz is below human hearing range. |
 | `TONE_AMPLITUDE` | `0.08` | Amplitude of the tone (0.0–1.0). Low enough to be inaudible. |
-| `ALSA_PCM_LEVEL` | `13` | ALSA PCM level applied to the dongle card on each pulse cycle. Adjust if dongle volume is too low or too high. |
+| `ALSA_PCM_LEVEL` | `100` | ALSA PCM level enforced by the watchdog on `PCM,0` and `PCM,1`. Should stay at 100 — the actual volume is controlled in software by the `h510-soft` virtual sink. |
+| `LOOPBACK_SINK_NAME` | `h510-soft` | Name of the virtual sink that becomes the default when the dongle is detected. Change if you have a conflict with an existing sink name. |
+| `LOOPBACK_DESCRIPTION` | `"H510-PRO (Software Volume)"` | User-facing label shown in the system's audio output menu. |
 | `PORT` | `8000` | Port for the REST API. Also set in `install.sh` (line 20). |
 
 After editing, re-run `bash install.sh` to redeploy with the new values.
@@ -164,9 +185,37 @@ Most common cause: PipeWire/PulseAudio not ready when the service starts. The `E
 
 **Dongle mode: no audio after installation**
 
-The ALSA PCM fix runs only on pulse cycles (every 8 min). To trigger it immediately, restart the service:
+The ALSA watchdog reapplies `PCM,0`/`PCM,1` at 100% on dongle detection and on every mixer event. If the service did not pick up the dongle (e.g. it was plugged in before the service started), restart the service:
 ```bash
 systemctl --user restart h510-pro-unlimited
+```
+
+---
+
+**Audio plays only on the left side / volume can't be lowered**
+
+This is the original H510-PRO bug the service is built around. Check that:
+
+1. The virtual sink is active and is the default:
+   ```bash
+   pactl get-default-sink   # should print: h510-soft
+   pactl list sinks short | grep h510-soft
+   ```
+2. The loopback is routed to the H510 (and not to the laptop speakers):
+   ```bash
+   pw-link -l | grep -A1 'pw-loopback'   # the |-> arrow must point to alsa_output.usb-XiiSound...H510...
+   ```
+3. The hardware controls are locked at 100%:
+   ```bash
+   amixer -c <H510-card-id> cget numid=9    # PCM,0 should be values=100,100
+   amixer -c <H510-card-id> cget numid=10   # PCM,1 should be values=100
+   ```
+
+If the app you're playing audio with predates the loopback (i.e. it was open when the dongle was plugged in), it may still be pinned to the raw H510 sink. Either restart the app or migrate it manually:
+```bash
+for input in $(pactl list sink-inputs short | awk '{print $1}'); do
+  pactl move-sink-input "$input" h510-soft
+done
 ```
 
 ---
